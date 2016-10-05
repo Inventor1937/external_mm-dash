@@ -4,7 +4,7 @@ include $(CLEAR_VARS)
 # ---------------------------------------------------------------------------------
 #            Common definitons
 # ---------------------------------------------------------------------------------
-LOCAL_SRC_FILES:=                       \
+LOCAL_SRC_FILES :=                       \
         DashPlayer.cpp                  \
         DashPlayerDriver.cpp            \
         DashPlayerRenderer.cpp          \
@@ -25,9 +25,11 @@ LOCAL_SHARED_LIBRARIES :=       \
     libstagefright_omx          \
     libutils                    \
     libui                       \
+    libOmxCore					\
+    libmemalloc
 
 LOCAL_C_INCLUDES := \
-        $(TOP)/frameworks/av/media/libstagefright/timedtext           \
+    $(TOP)/frameworks/av/media/libstagefright/timedtext           \
 	$(TOP)/frameworks/native/include/media/hardware               \
 	$(TOP)/frameworks/native/include/media/openmax                \
 	$(TOP)/frameworks/av/media/libstagefright/httplive            \
@@ -38,8 +40,10 @@ LOCAL_C_INCLUDES := \
 	$(TOP)/frameworks/av/media/libstagefright/rtsp                \
 	$(TOP)/hardware/qcom/media/mm-core/inc                        \
 	$(TOP)/hardware/qcom/display/libgralloc                       \
-        $(LOCAL_PATH)/..                                            \
-	$(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
+    $(LOCAL_PATH)/..                                              \
+	$(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include			  \
+	$(TARGET_OUT)/../obj/include/mm-core/omxcore				  \
+	$(TARGET_OUT)/../obj/include/qcom/display
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
 
