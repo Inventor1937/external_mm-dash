@@ -45,12 +45,16 @@ checkExtMedia(JNIEnv *env, jobject thiz){
     bool nRet = false;
     clazz = env->FindClass("com/qualcomm/qcmedia/QCMediaPlayer");
     if (clazz != NULL) {
+        #ifndef QC_SKIP_MEDIAPLAYER_CHECK
         if (env->IsInstanceOf(thiz,clazz)) {
+        #endif
             nRet = true;
             ALOGD("QCMediaPlayer mediaplayer present");
+        #ifndef QC_SKIP_MEDIAPLAYER_CHECK
         } else {
             ALOGE("env->IsInstanceOf fails");
         }
+        #endif
     } else {
         //Clear the exception as QCMediaPlayer is optional
         env->ExceptionClear();
@@ -60,10 +64,10 @@ checkExtMedia(JNIEnv *env, jobject thiz){
 }
 
 JNIExtMediaPlayerListener::JNIExtMediaPlayerListener(JNIEnv* env, jobject thiz, jobject weak_thiz,const sp<MediaPlayerListener>& listener) {
-    jclass clazz = env->GetObjectClass(thiz);
+    jclass clazz = env->FindClass("com/qualcomm/qcmedia/QCMediaPlayer");
     if (clazz == NULL) {
-        ALOGE("Can't find android/media/MediaPlayer");
-        jniThrowException(env, "java/lang/Exception", NULL);
+        ALOGE("Can't find QCMediaPlayer class");
+        jniThrowException(env, "java/lang/ClassNotFoundException", NULL);
         return;
     }
     mpListener = listener;
