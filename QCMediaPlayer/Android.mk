@@ -14,8 +14,5 @@ LOCAL_MODULE := qcmediaplayer
 LOCAL_MODULE_PATH := $(TARGET_OUT_JAVA_LIBRARIES)
 
 ifeq ($(TARGET_ENABLE_QC_AV_ENHANCEMENTS),true)
-$(info Qualcomm Audio/Video Enhancements are ENABLED. DASH & QCMediaPlayer are included.)
 include $(BUILD_JAVA_LIBRARY)
-else
-$(info No Qualcomm Audio/Video Enhancements support)
 endif
