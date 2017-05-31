@@ -103,11 +103,19 @@ struct DashPlayer::Source : public RefBase {
 
     virtual status_t getTrackCount()
     {
-      return INVALID_OPERATION;
+       return INVALID_OPERATION;
     }
 
     virtual bool isPlaybackDiscontinued() {
       return false;
+    }
+
+    virtual bool isLiveStream() {
+        return false;
+    }
+
+    virtual bool isLookAheadWindowModeEnabled() {
+        return false;
     }
 
 protected:

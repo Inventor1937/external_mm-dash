@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -35,8 +35,7 @@ namespace android {
 
 DashPlayerStats::DashPlayerStats() {
       Mutex::Autolock autoLock(mStatsLock);
-      mMIME = new char[strlen(NO_MIMETYPE_AVAILABLE)+1];
-      strlcpy(mMIME,NO_MIMETYPE_AVAILABLE, strlen(NO_MIMETYPE_AVAILABLE)+1);
+      mMIME = NO_MIMETYPE_AVAILABLE;
       mNumVideoFramesDecoded = 0;
       mNumVideoFramesDropped = 0;
       mConsecutiveFramesDropped = 0;
@@ -67,10 +66,6 @@ DashPlayerStats::~DashPlayerStats() {
       fclose(mFileOut);
       mFileOut = NULL;
     }
-    if(mMIME) {
-        delete[] mMIME;
-        mMIME = NULL;
-    }
 }
 
 void DashPlayerStats::setFileDescAndOutputStream(int fd) {
@@ -86,14 +81,7 @@ void DashPlayerStats::setFileDescAndOutputStream(int fd) {
 void DashPlayerStats::setMime(const char* mime) {
     Mutex::Autolock autoLock(mStatsLock);
     if(mime != NULL) {
-        int mimeLen = (int)strlen(mime);
-        if(mMIME) {
-          delete[] mMIME;
-          mMIME = NULL;
-        }
-
-        mMIME = new char[mimeLen+1];
-        strlcpy(mMIME,mime,mimeLen+1);
+       mMIME.setTo(mime);
     }
 }
 
@@ -132,7 +120,7 @@ void DashPlayerStats::logStatistics() {
     if(mFileOut) {
         Mutex::Autolock autoLock(mStatsLock);
         fprintf(mFileOut, "=====================================================\n");
-        fprintf(mFileOut, "Mime Type: %s\n",mMIME);
+        fprintf(mFileOut, "Mime Type: %s\n",mMIME.c_str());
         fprintf(mFileOut, "Number of total frames: %llu\n",(unsigned long long)mTotalFrames);
         fprintf(mFileOut, "Number of frames dropped: %lld\n",(signed long long)mNumVideoFramesDropped);
         fprintf(mFileOut, "Number of frames rendered: %llu\n",(unsigned long long)mTotalRenderingFrames);

@@ -13,14 +13,11 @@ LOCAL_SHARED_LIBRARIES := \
     libstagefright \
     libstagefright_foundation \
     libdl \
-    libqcmediaplayer
 
 LOCAL_C_INCLUDES += \
     $(TOP)/frameworks/base/core/jni \
     $(TOP)/frameworks/av/media/libstagefright \
     $(LOCAL_PATH)/.. \
-
-LOCAL_CFLAGS := -DQC_SKIP_MEDIAPLAYER_CHECK
 
 LOCAL_MODULE:= libextmedia_jni
 

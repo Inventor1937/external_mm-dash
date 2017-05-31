@@ -40,10 +40,8 @@ LOCAL_C_INCLUDES := \
 	$(TOP)/frameworks/av/media/libstagefright/rtsp                \
 	$(TOP)/hardware/qcom/media/mm-core/inc                        \
 	$(TOP)/hardware/qcom/display/libgralloc                       \
-    $(LOCAL_PATH)/..                                              \
-	$(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include			  \
-	$(TARGET_OUT)/../obj/include/mm-core/omxcore				  \
-	$(TARGET_OUT)/../obj/include/qcom/display
+        $(LOCAL_PATH)/..                                            \
+	$(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
 
 LOCAL_ADDITIONAL_DEPENDENCIES := $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
 

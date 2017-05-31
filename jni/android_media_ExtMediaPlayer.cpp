@@ -45,16 +45,12 @@ checkExtMedia(JNIEnv *env, jobject thiz){
     bool nRet = false;
     clazz = env->FindClass("com/qualcomm/qcmedia/QCMediaPlayer");
     if (clazz != NULL) {
-        #ifndef QC_SKIP_MEDIAPLAYER_CHECK
         if (env->IsInstanceOf(thiz,clazz)) {
-        #endif
             nRet = true;
             ALOGD("QCMediaPlayer mediaplayer present");
-        #ifndef QC_SKIP_MEDIAPLAYER_CHECK
         } else {
             ALOGE("env->IsInstanceOf fails");
         }
-        #endif
     } else {
         //Clear the exception as QCMediaPlayer is optional
         env->ExceptionClear();
@@ -64,10 +60,10 @@ checkExtMedia(JNIEnv *env, jobject thiz){
 }
 
 JNIExtMediaPlayerListener::JNIExtMediaPlayerListener(JNIEnv* env, jobject thiz, jobject weak_thiz,const sp<MediaPlayerListener>& listener) {
-    jclass clazz = env->FindClass("com/qualcomm/qcmedia/QCMediaPlayer");
+    jclass clazz = env->GetObjectClass(thiz);
     if (clazz == NULL) {
-        ALOGE("Can't find QCMediaPlayer class");
-        jniThrowException(env, "java/lang/ClassNotFoundException", NULL);
+        ALOGE("Can't find android/media/MediaPlayer");
+        jniThrowException(env, "java/lang/Exception", NULL);
         return;
     }
     mpListener = listener;
@@ -89,37 +85,44 @@ JNIExtMediaPlayerListener::~JNIExtMediaPlayerListener() {
 
 
 void JNIExtMediaPlayerListener::notify(int msg, int ext1, int ext2, const Parcel *obj) {
-    JNIEnv *env = AndroidRuntime::getJNIEnv();
-    if (env && obj && obj->dataSize() > 0) {
-        jobject jParcel = createJavaParcelObject(env);
-        if (jParcel != NULL) {
-            if((extfields.ext_post_event != NULL) &&
-            ((msg == MEDIA_PREPARED) || (msg == MEDIA_TIMED_TEXT) || (msg == MEDIA_QOE))) {
-                ALOGE("JNIExtMediaPlayerListener::notify calling ext_post_event");
-                Parcel* nativeParcel = parcelForJavaObject(env, jParcel);
-                if(nativeParcel != NULL) {
-                    nativeParcel->setData(obj->data(), obj->dataSize());
-                    env->CallStaticVoidMethod(mClass, extfields.ext_post_event, mObject,
-                    msg, ext1, ext2, jParcel);
-                    env->DeleteLocalRef(jParcel);
-                    ALOGD("JNIExtMediaPlayerListener::notify ext_post_event done");
-                }
-            } else {
-                ALOGD("JNIExtMediaPlayerListener::notify calling for generic event");
-                mpListener->notify(msg, ext1, ext2, obj);
-            }
-        }
-    } else {
-        if((extfields.ext_post_event != NULL) &&
-            ((msg == MEDIA_PREPARED) || (msg == MEDIA_TIMED_TEXT) ||(msg == MEDIA_QOE)))
+    if((extfields.ext_post_event != NULL) &&
+       ((msg == MEDIA_PREPARED) || (msg == MEDIA_TIMED_TEXT) ||(msg == MEDIA_QOE)))
+    {
+      ALOGD("JNIExtMediaPlayerListener::notify calling ext_post_events %d", msg);
+      jobject jParcel = NULL;
+      JNIEnv *env = AndroidRuntime::getJNIEnv();
+      if (env)
+      {
+        if (obj && obj->dataSize() > 0)
         {
-            ALOGD("JNIExtMediaPlayerListener::notify calling ext_post_events");
-            env->CallStaticVoidMethod(mClass, extfields.ext_post_event, mObject, msg, ext1, ext2, NULL);
-        } else {
-            ALOGD("JNIExtMediaPlayerListener::notify for generic events");
-            mpListener->notify(msg, ext1, ext2, obj);
+          jobject jParcel = createJavaParcelObject(env);
+          if (jParcel != NULL)
+          {
+            Parcel* nativeParcel = parcelForJavaObject(env, jParcel);
+            if (nativeParcel != NULL)
+            {
+              nativeParcel->setData(obj->data(), obj->dataSize());
+              env->CallStaticVoidMethod(mClass, extfields.ext_post_event, mObject, msg, ext1, ext2, jParcel);
+              env->DeleteLocalRef(jParcel);
+            }
+          }
         }
+        else
+        {
+          env->CallStaticVoidMethod(mClass, extfields.ext_post_event, mObject, msg, ext1, ext2, NULL);
+        }
+      }
+      else
+      {
+        ALOGE("JNIExtMediaPlayerListener::notify env is NULL");
+      }
     }
+    else
+    {
+      ALOGD("JNIExtMediaPlayerListener::notify generic event %d", msg);
+      mpListener->notify(msg, ext1, ext2, obj);
+    }
+
     return;
 }
 

@@ -34,6 +34,7 @@
 #include <utils/RefBase.h>
 #include <utils/threads.h>
 #include <utils/Log.h>
+#include <media/stagefright/foundation/AString.h>
 
 namespace android {
 
@@ -68,7 +69,7 @@ class DashPlayerStats : public RefBase {
 
     mutable Mutex mStatsLock;
     bool mStatistics;
-    char* mMIME;
+    AString mMIME;
     int64_t mNumVideoFramesDecoded;
     int64_t mNumVideoFramesDropped;
     int64_t mConsecutiveFramesDropped;

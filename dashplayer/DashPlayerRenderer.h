@@ -45,11 +45,19 @@ struct DashPlayer::Renderer : public AHandler {
     void resume();
     void notifySeekPosition(int64_t seekTime);
 
+    void queueDelay(int64_t delayUs);
+
     enum {
         kWhatEOS                = 'eos ',
         kWhatFlushComplete      = 'fluC',
         kWhatPosition           = 'posi',
     };
+
+    void setLiveStream(bool bLiveStream);
+
+    void signalRefreshAnchorRealTime(bool bAddStartUpLatency);
+
+    void setLookAheadWindowMode(bool bLookAheadWindowMode);
 
 protected:
     virtual ~Renderer();
@@ -66,6 +74,7 @@ private:
         kWhatAudioSinkChanged   = 'auSC',
         kWhatPause              = 'paus',
         kWhatResume             = 'resm',
+        kWhatDelayQueued        = 'queD'
     };
 
     struct QueueEntry {
@@ -85,11 +94,14 @@ private:
 
     bool mDrainAudioQueuePending;
     bool mDrainVideoQueuePending;
+    bool mDrainVideoQueuePendingUntilFirstAudio;
     int32_t mAudioQueueGeneration;
     int32_t mVideoQueueGeneration;
 
     int64_t mAnchorTimeMediaUs;
     int64_t mAnchorTimeRealUs;
+    int64_t mRealTimeOffsetUs;
+
     int64_t mSeekTimeUs;
 
     Mutex mFlushLock;  // protects the following 2 member vars.
@@ -99,9 +111,6 @@ private:
     bool mHasAudio;
     bool mHasVideo;
     bool mSyncQueues;
-
-    bool mIsFirstVideoframeReceived;
-    bool mPendingPostAudioDrains;
 
     bool mPaused;
     bool mWasPaused; // if paused then store the info
@@ -131,6 +140,10 @@ private:
     bool dropBufferWhileFlushing(bool audio, const sp<AMessage> &msg);
     void syncQueuesDone();
 
+    void onDelayQueued();
+
+    void setStartAnchorMediaAndPostDrainQueue();
+
     // for qualcomm statistics profiling
   public:
     void registerStats(sp<DashPlayerStats> stats);
@@ -139,6 +152,24 @@ private:
   private:
     sp<DashPlayerStats> mStats;
     int mLogLevel;
+
+    int64_t mLastReceivedVideoSampleUs;
+    bool mDelayPending;
+    int64_t mDelayToQueueUs;
+    int64_t mDelayToQueueTimeRealUs;
+
+    bool mIsLiveStream;
+
+    Mutex mRendererDataLock;
+
+    int64_t mStartUpLatencyBeginUs;
+    int64_t mStartUpLatencyUs;
+
+    bool mDiscFromAnchorRealTimeRefresh;
+
+    int64_t mLastRenderedTimeMediaUs;
+
+    bool mLookAheadWindowMode;
 
     DISALLOW_EVIL_CONSTRUCTORS(Renderer);
 };

@@ -1,5 +1,5 @@
 /*
- *Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ *Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *Not a Contribution, Apache license notifications and license are retained
  *for attribution purposes only.
  *
@@ -46,6 +46,9 @@
 #define DP_MSG_HIGH(...) if(mLogLevel >= 1){ALOGE(__VA_ARGS__);}
 #define DP_MSG_MEDIUM(...) if(mLogLevel >= 2){ALOGE(__VA_ARGS__);}
 #define DP_MSG_LOW(...) if(mLogLevel >= 3){ALOGE(__VA_ARGS__);}
+
+#define AUDIO_DISCONTINUITY_THRESHOLD 100000ll
+#define AUDIO_TS_DISCONTINUITY_THRESHOLD 200000ll
 
 namespace android {
 
@@ -138,7 +141,17 @@ DashPlayer::DashPlayer()
       mTimedTextCEASamplesDisc(false),
       mCurrentWidth(0),
       mCurrentHeight(0),
-      mColorFormat(0) {
+      mColorFormat(0),
+      mDPBSize(0),
+      mDPBCheckToDelayRendering(true),
+      mVideoDecoderStartTimeUs(0),
+      mVideoDecoderSetupTimeUs(0),
+      mDelayRenderingUs(0),
+      mStarted(false),
+      mFirstVideoSampleUs(-1),
+      mVideoSampleDurationUs(0),
+      mLastReadAudioMediaTimeUs(-1),
+      mLastReadAudioRealTimeUs(-1) {
       mTrackName = new char[6];
 
       char property_value[PROPERTY_VALUE_MAX] = {0};
@@ -162,6 +175,11 @@ DashPlayer::~DashPlayer() {
     }
     if (mTextDecoder != NULL) {
       looper()->unregisterHandler(mTextDecoder->id());
+    }
+    if (mCCDecoder != NULL)
+    {
+      mCCDecoder = NULL;
+      DP_MSG_ERROR("mCCDecoder deleted");
     }
     if(mStats != NULL) {
         mStats->logFpsSummary();
@@ -308,7 +326,9 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
             /* reinstantiation of video decoder and video playback continues.       */
             /*  TODO: Dynamic disible and reenable of video also requies support    */
             /* from dash source.                                                    */
-            DP_MSG_ERROR("kWhatSetVideoNativeWindow");
+
+            DP_MSG_ERROR("kWhatSetVideoNativeWindow mStarted %d",mStarted);
+>>>>>>> LA.UM.5.5.r1-04600-8x96.0
 
             /* if existing instance mNativeWindow=NULL updates mNativeWindow to new
              * new value and triggers scan sources. postScanSources() needs to be
@@ -330,6 +350,12 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
               sp<DashPlayerDriver> driver = mDriver.promote();
               if (driver != NULL) {
                  driver->notifySetSurfaceComplete();
+                  int currentPositionMs = 0;
+                  if (mStarted && obj.get() != NULL && driver->getCurrentPosition(&currentPositionMs) == OK) {
+                    DP_MSG_HIGH("posting Seek after kWhatSetVideoNativeWindow at time %d ms",currentPositionMs);
+                     int64_t seekTimeUs = currentPositionMs*1000ll;
+                     seekToAsync(seekTimeUs);
+                  }
                 }
               }
 
@@ -400,7 +426,7 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
         case kWhatStart:
         {
             DP_MSG_ERROR("kWhatStart");
-
+            mStarted = true;
             mVideoIsAVC = false;
             mAudioEOS = false;
             mVideoEOS = false;
@@ -583,11 +609,13 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 bool needShutdown = false;
 
                 if (track == kAudio) {
-                    CHECK(IsFlushingState(mFlushingAudio, &needShutdown));
-                    mFlushingAudio = FLUSHED;
+                    if(IsFlushingState(mFlushingAudio, &needShutdown)) {
+                        mFlushingAudio = FLUSHED;
+                    }
                 } else if (track == kVideo){
-                    CHECK(IsFlushingState(mFlushingVideo, &needShutdown));
-                    mFlushingVideo = FLUSHED;
+                    if(IsFlushingState(mFlushingVideo, &needShutdown)) {
+                        mFlushingVideo = FLUSHED;
+                    }
 
                     mVideoLateByUs = 0;
                 }
@@ -638,13 +666,9 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
                       DP_MSG_ERROR("Source is null. Exit outputFormatChanged\n");
                       break;
                     }
-                    if (mVideoDecoder == NULL &&
-                            mSource->getDuration(&durationUs) == OK &&
-                            durationUs > AUDIO_SINK_MIN_DEEP_BUFFER_DURATION_US) {
-                        flags = AUDIO_OUTPUT_FLAG_DEEP_BUFFER;
-                    } else {
-                        flags = AUDIO_OUTPUT_FLAG_NONE;
-                    }
+
+                    //Open audio track/sink in deep_buffer mode
+                    flags = AUDIO_OUTPUT_FLAG_DEEP_BUFFER;
 
                     int32_t channelMask;
                     if (!format->findInt32("channel-mask", &channelMask)) {
@@ -676,6 +700,11 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
                     CHECK(format->findInt32("height", &mCurrentHeight));
                     CHECK(format->findInt32("color-format", &mColorFormat));
                     DP_MSG_ERROR("@@@@:: Dashplayer :: MESSAGE FROM CODEC +++++++++++++++++++++++++++++++ kWhatOutputFormatChanged:: video new height:%d width%d", mCurrentWidth, mCurrentHeight);
+                    CHECK(msg->findInt32("dpb-size", &mDPBSize));
+                    // Port settings change. Reset below flag to check if
+                    // decoderSetupTime < renderingtime#dpbframes in renderBuffer() and introduce rendering delay
+                    mDPBCheckToDelayRendering = true;
+                    mFirstVideoSampleUs = -1;
                 }
             } else if (what == Decoder::kWhatShutdownCompleted) {
                 DP_MSG_ERROR("%s shutdown completed", mTrackName);
@@ -728,9 +757,15 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
                 }
             } else if (what == Decoder::kWhatDrainThisBuffer) {
                 if(track == kAudio || track == kVideo) {
-                   DP_MSG_LOW("@@@@:: Dashplayer :: MESSAGE FROM CODEC +++++++++++++++++++++++++++++++ Codec::kWhatRenderBuffer:: %s",track == kAudio ? "audio" : "video");
-                        renderBuffer(track, msg);
+                    DP_MSG_LOW("@@@@:: Dashplayer :: MESSAGE FROM CODEC +++++++++++++++++++++++++++++++ Codec::kWhatRenderBuffer:: %s",track == kAudio ? "audio" : "video");
+
+                    // Compute video decoder setup time whenever new decoder is instantiated
+                    // Used to compute startup delay for livestreams when high dpbSize
+                    if (track == kVideo && mVideoDecoderSetupTimeUs == 0) {
+                        mVideoDecoderSetupTimeUs = ALooper::GetNowUs() - mVideoDecoderStartTimeUs;
                     }
+                    renderBuffer(track, msg);
+                }
             } else {
                 DP_MSG_LOW("Unhandled codec notification %d.", what);
             }
@@ -867,7 +902,6 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
 
             DP_MSG_ERROR("kWhatSeek seekTimeUs=%lld us (%.2f secs)",
                  seekTimeUs, (double)seekTimeUs / 1E6);
-
             nRet = mSource->seekTo(seekTimeUs);
 
             if (nRet == OK) { // if seek success then flush the audio,video decoder and renderer
@@ -1214,11 +1248,60 @@ void DashPlayer::onMessageReceived(const sp<AMessage> &msg) {
                }
            break;
            }
+           case kWhatClosedCaptionNotify:
+           {
+             onClosedCaptionNotify(msg);
+             break;
+           }
 
         default:
             TRESPASS();
             break;
     }
+}
+
+void DashPlayer::onClosedCaptionNotify(const sp<AMessage> &msg) {
+  int32_t what;
+  CHECK(msg->findInt32("what", &what));
+  switch (what)
+  {
+    case DashPlayer::CCDecoder::kWhatClosedCaptionData:
+    {
+      sp<ABuffer> buffer;
+      CHECK(msg->findBuffer("buffer", &buffer));
+      size_t inbandTracks = 0;
+      if (mSource != NULL)
+      {
+        inbandTracks = mSource->getTrackCount();
+      }
+      sendSubtitleData(buffer, inbandTracks);
+      break;
+    }
+    case DashPlayer::CCDecoder::kWhatTrackAdded:
+    {
+      notifyListener(MEDIA_INFO, MEDIA_INFO_METADATA_UPDATE, 0);
+      break;
+    }
+    default:
+      TRESPASS();
+  }
+}
+
+void DashPlayer::sendSubtitleData(const sp<ABuffer> &buffer, int32_t baseIndex)
+{
+  int32_t trackIndex;
+  int64_t timeUs, durationUs;
+  CHECK(buffer->meta()->findInt32("trackIndex", &trackIndex));
+  CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
+  CHECK(buffer->meta()->findInt64("durationUs", &durationUs));
+  Parcel in;
+  in.writeInt32(trackIndex + baseIndex);
+  in.writeInt64(timeUs);
+  in.writeInt64(durationUs);
+  in.writeInt32(buffer->size());
+  in.writeInt32(buffer->size());
+  in.write(buffer->data(), buffer->size());
+  notifyListener(MEDIA_SUBTITLE_DATA, 0, 0, &in);
 }
 
 void DashPlayer::finishFlushIfPossible() {
@@ -1358,6 +1441,7 @@ void DashPlayer::finishReset() {
             driver->notifyResetComplete();
         }
     }
+    mStarted = false;
 }
 
 void DashPlayer::postScanSources() {
@@ -1408,6 +1492,10 @@ status_t DashPlayer::instantiateDecoder(int track, sp<Decoder> *decoder) {
         }
     }
 
+    if (mSource != NULL) {
+        mRenderer->setLiveStream(mSource->isLiveStream());
+    }
+
     sp<AMessage> notify;
     if (track == kAudio) {
         notify = new AMessage(kWhatAudioNotify ,this);
@@ -1417,13 +1505,38 @@ status_t DashPlayer::instantiateDecoder(int track, sp<Decoder> *decoder) {
          if (mRenderer != NULL) {
             mRenderer->setMediaPresence(true,true);
         }
+
+        mLastReadAudioMediaTimeUs = -1;
+
     } else if (track == kVideo) {
         notify = new AMessage(kWhatVideoNotify ,this);
         *decoder = new Decoder(notify, mNativeWindow);
         DP_MSG_HIGH("Creating Video Decoder ");
+        sp<AMessage> ccNotify = new AMessage(kWhatClosedCaptionNotify, this);
+        if (mCCDecoder == NULL)
+        {
+          mCCDecoder = new CCDecoder(ccNotify);
+          if (mCCDecoder != NULL)
+          {
+            DP_MSG_MEDIUM("CCDecoder Create:Success");
+          }
+          else
+          {
+            DP_MSG_ERROR("CCDecoder Create:Fail");
+          }
+        }
+        else
+        {
+           DP_MSG_HIGH("CCDecoder:Exists");
+        }
         if (mRenderer != NULL) {
             mRenderer->setMediaPresence(false,true);
         }
+
+        mVideoDecoderSetupTimeUs = 0;
+        mVideoDecoderStartTimeUs = ALooper::GetNowUs();
+        mDelayRenderingUs = 0;
+
     } else if (track == kText) {
         mTextNotify = new AMessage(kWhatTextNotify ,this);
         *decoder = new Decoder(mTextNotify);
@@ -1477,8 +1590,8 @@ status_t DashPlayer::feedDecoderInputData(int track, const sp<AMessage> &msg) {
     {
         Mutex::Autolock autoLock(mLock);
 
-        if (reply != NULL && (((track == kAudio) && mFlushingAudio != NONE)
-            || ((track == kVideo) && mFlushingVideo != NONE)
+        if (reply != NULL && (((track == kAudio) && IsFlushingState(mFlushingAudio))
+            || ((track == kVideo) && IsFlushingState(mFlushingVideo))
             || mSource == NULL)) {
             reply->setInt32("err", INFO_DISCONTINUITY);
             reply->post();
@@ -1577,6 +1690,46 @@ status_t DashPlayer::feedDecoderInputData(int track, const sp<AMessage> &msg) {
             }
         }
 
+        if (err == OK && mSource != NULL && mSource->isLiveStream()) {
+            int64_t timeUs;
+            CHECK(accessUnit->meta()->findInt64("timeUs", &timeUs));
+
+            int32_t lookAheadWindowMode = 0;
+            if (accessUnit->meta()->findInt32("lookAheadWindowMode", &lookAheadWindowMode)) {
+                mRenderer->setLookAheadWindowMode(lookAheadWindowMode);
+            }
+
+            if (lookAheadWindowMode) {
+                if (track == kAudio) {
+                    int32_t disc = 0;
+                    accessUnit->meta()->findInt32("lookAheadWindowSampledisc", &disc);
+                    if (disc) {
+                        DP_MSG_ERROR("feedDecoderInputData discontinuity at sample %lld msec", (int64_t)timeUs/1000);
+                        mSkipRenderingAudioUntilMediaTimeUs = timeUs;
+                    }
+                }
+
+                int32_t windowResize = 0;
+                accessUnit->meta()->findInt32("lookAheadWindowResized", &windowResize);
+                if (windowResize && mRenderer != NULL) {
+                    DP_MSG_ERROR("feedDecoderInputData bufwindowresized at sample %lld msec", (int64_t)timeUs/1000);
+                    mRenderer->signalRefreshAnchorRealTime(true);
+                }
+            } else {
+                if (track == kAudio) {
+                    if (timeUs >=0 && mLastReadAudioMediaTimeUs >= 0 &&
+                       ((timeUs - mLastReadAudioMediaTimeUs) > AUDIO_TS_DISCONTINUITY_THRESHOLD) &&
+                       ((ALooper::GetNowUs() - mLastReadAudioRealTimeUs) > AUDIO_DISCONTINUITY_THRESHOLD)) {
+                        if (mRenderer != NULL && mDPBSize > 0 && mVideoSampleDurationUs > 0) {
+                            mRenderer->queueDelay(mDPBSize * mVideoSampleDurationUs);
+                        }
+                    }
+                    mLastReadAudioMediaTimeUs = timeUs;
+                    mLastReadAudioRealTimeUs = ALooper::GetNowUs();
+                }
+            }
+        }
+
         dropAccessUnit = false;
         if (track == kVideo) {
 
@@ -1631,6 +1784,8 @@ void DashPlayer::renderBuffer(bool audio, const sp<AMessage> &msg) {
 
     sp<ABuffer> buffer;
     CHECK(msg->findBuffer("buffer", &buffer));
+    int64_t mediaTimeUs;
+    CHECK(buffer->meta()->findInt64("timeUs", &mediaTimeUs));
 
     int64_t &skipUntilMediaTimeUs =
         audio
@@ -1638,9 +1793,6 @@ void DashPlayer::renderBuffer(bool audio, const sp<AMessage> &msg) {
             : mSkipRenderingVideoUntilMediaTimeUs;
 
     if (skipUntilMediaTimeUs >= 0) {
-        int64_t mediaTimeUs;
-        CHECK(buffer->meta()->findInt64("timeUs", &mediaTimeUs));
-
         if (mediaTimeUs < skipUntilMediaTimeUs) {
             DP_MSG_HIGH("dropping %s buffer at time %lld as requested.",
                  audio ? "audio" : "video",
@@ -1648,6 +1800,10 @@ void DashPlayer::renderBuffer(bool audio, const sp<AMessage> &msg) {
 
             reply->post();
             return;
+        }
+
+        if (mediaTimeUs == skipUntilMediaTimeUs) {
+            buffer->meta()->setInt32("disc", 1);
         }
 
         skipUntilMediaTimeUs = -1;
@@ -1670,17 +1826,39 @@ void DashPlayer::renderBuffer(bool audio, const sp<AMessage> &msg) {
             sp<GraphicBuffer> graphicBuffer = static_cast<GraphicBuffer*>(obj.get());
             if (graphicBuffer != NULL)
             {
-              DP_MSG_LOW("kwhatdrainthisbuffer: Extradata present",
-                  "graphicBuffer = %p, width=%d height=%d color-format=%d",
+              size_t filledLen = 0, allocLen = 0;
+              DP_MSG_LOW("kwhatdrainthisbuffer: Extradata present graphicBuffer = %p, width=%d height=%d color-format=%d",
                   graphicBuffer.get(), mCurrentWidth, mCurrentHeight, mColorFormat);
 
               if (mColorFormat == 0x7FA30C04 /*OMX_QCOM_COLOR_FormatYUV420PackedSemiPlanar32m*/)
               {
-                size_t filledLen = (VENUS_Y_STRIDE(COLOR_FMT_NV12, mCurrentWidth)
+                filledLen = (VENUS_Y_STRIDE(COLOR_FMT_NV12, mCurrentWidth)
                                     * VENUS_Y_SCANLINES(COLOR_FMT_NV12, mCurrentHeight))
                                           +  (VENUS_UV_STRIDE(COLOR_FMT_NV12, mCurrentWidth)
                                               * VENUS_UV_SCANLINES(COLOR_FMT_NV12, mCurrentHeight));
-                size_t allocLen = VENUS_BUFFER_SIZE(COLOR_FMT_NV12, mCurrentWidth, mCurrentHeight);
+                allocLen = VENUS_BUFFER_SIZE(COLOR_FMT_NV12, mCurrentWidth, mCurrentHeight);
+              }
+              else if (mColorFormat == 0x7FA30C06 /*QOMX_COLOR_FORMATYUV420PackedSemiPlanar32mCompressed*/)
+              {
+                unsigned int y_stride = VENUS_Y_STRIDE(COLOR_FMT_NV12_UBWC, mCurrentWidth);
+                unsigned int uv_stride = VENUS_UV_STRIDE(COLOR_FMT_NV12_UBWC, mCurrentWidth);
+                unsigned int y_sclines = VENUS_Y_SCANLINES(COLOR_FMT_NV12_UBWC, mCurrentHeight);
+                unsigned int uv_sclines = VENUS_UV_SCANLINES(COLOR_FMT_NV12_UBWC, mCurrentHeight);
+                unsigned int y_ubwc_plane = MSM_MEDIA_ALIGN(y_stride * y_sclines, 4096);
+                unsigned int uv_ubwc_plane = MSM_MEDIA_ALIGN(uv_stride * uv_sclines, 4096);
+                unsigned int y_meta_stride = VENUS_Y_META_STRIDE(COLOR_FMT_NV12_UBWC, mCurrentWidth);
+                unsigned int y_meta_scanlines = VENUS_Y_META_SCANLINES(COLOR_FMT_NV12_UBWC, mCurrentHeight);
+                unsigned int y_meta_plane = MSM_MEDIA_ALIGN(y_meta_stride * y_meta_scanlines, 4096);
+                unsigned int uv_meta_stride = VENUS_UV_META_STRIDE(COLOR_FMT_NV12_UBWC, mCurrentWidth);
+                unsigned int uv_meta_scanlines = VENUS_UV_META_SCANLINES(COLOR_FMT_NV12_UBWC, mCurrentHeight);
+                unsigned int uv_meta_plane = MSM_MEDIA_ALIGN(uv_meta_stride * uv_meta_scanlines, 4096);
+
+                filledLen = y_ubwc_plane + uv_ubwc_plane + y_meta_plane + uv_meta_plane;
+                allocLen = VENUS_BUFFER_SIZE(COLOR_FMT_NV12_UBWC, mCurrentWidth, mCurrentHeight);
+              }
+
+              if (filledLen > 0 && allocLen > 0)
+              {
                 size_t offset = buffer->offset();
 
                 DP_MSG_LOW("kwhatdrainthisbuffer: decoded buffer ranges "
@@ -1726,107 +1904,175 @@ void DashPlayer::renderBuffer(bool audio, const sp<AMessage> &msg) {
                         "         STREAM_USERDATA:",
                         userdata->type, userdata_size);
 
-                      for (uint32_t i = 0; i < userdata_size; i+=4) {
-                        DP_MSG_LOW("        %x %x %x %x",
-                          data_ptr[i], data_ptr[i+1],
-                          data_ptr[i+2], data_ptr[i+3]);
-                      }
+                        for (uint32_t i = 0; i < userdata_size; i+=4) {
+                          DP_MSG_LOW("        %x %x %x %x",
+                            data_ptr[i], data_ptr[i+1],
+                            data_ptr[i+2], data_ptr[i+3]);
+                        }
 
                       DP_MSG_LOW(
                         "-------------- End of OMX_ExtraDataMP2UserData Userdata -----------");
 
-                      /*
-                      SEI Syntax
-
-                      user_data_registered_itu_t_t35 ( ) {
-                      itu_t_t35_country_code (8 bits)
-                      itu_t_t35_provider_code (16 bits)
-                      user_identifier (32 bits)
-                      user_structure( )
-                      }
-
-                      cc_data parsing logic
-                      1. itu_t_t35_country_code - A fixed 8-bit field, the value of which shall be 0xB5.3
-                      itu_t_35_provider_code - A fixed 16-bit field, the value of which shall be 0x0031.
-                      2. user_identifier should match 0x47413934 ('GA94') ATSC_user_data( )
-
-                      ATSC_user_data Syntax
-                      ATSC_user_data() {
-                      user_data_type_code (8 bits)
-                      user_data_type_structure()
-                      }
-
-                      3. user_data_type_code should match 0x03 MPEG_cc_data()
-
-                      */
-
-                      if(0xB5 == data_ptr[0] && 0x00 == data_ptr[1] && 0x31 == data_ptr[2]
-                      && 0x47 == data_ptr[3] && 0x41 == data_ptr[4] && 0x39 == data_ptr[5] && 0x34 == data_ptr[6]
-                      && 0x03 == data_ptr[7])
+                      if (mCCDecoder != NULL)
                       {
-                        DP_MSG_HIGH("SEI payload user_data_type_code is CEA encoded MPEG_cc_data()");
+                          DP_MSG_HIGH("mCCDecoder->decode %lld",mediaTimeUs);
+                          mCCDecoder->decode(data_ptr, userdata_size, mediaTimeUs);
+                      }
+                      else
+                      {
+                        /*
+                          SEI Syntax
 
-                        OMX_U32 cc_data_size = 0;
-                        for(int i = 8; data_ptr[i] != 0xFF /*each cc_data ends with marker bits*/; i++)
+                          user_data_registered_itu_t_t35 ( ) {
+                          itu_t_t35_country_code (8 bits)
+                          itu_t_t35_provider_code (16 bits)
+                          user_identifier (32 bits)
+                          user_structure( )
+                          }
+
+                          cc_data parsing logic
+                          1. itu_t_t35_country_code - A fixed 8-bit field, the value of which shall be 0xB5.3
+                          itu_t_35_provider_code - A fixed 16-bit field, the value of which shall be 0x0031.
+                          2. user_identifier should match 0x47413934 ('GA94') ATSC_user_data( )
+
+                          ATSC_user_data Syntax
+                          ATSC_user_data() {
+                          user_data_type_code (8 bits)
+                          user_data_type_structure()
+                          }
+
+                          3. user_data_type_code should match 0x03 MPEG_cc_data()
+
+                        */
+
+                        if(0xB5 == data_ptr[0] && 0x00 == data_ptr[1] && 0x31 == data_ptr[2]
+                        && 0x47 == data_ptr[3] && 0x41 == data_ptr[4] && 0x39 == data_ptr[5] && 0x34 == data_ptr[6]
+                        && 0x03 == data_ptr[7])
                         {
-                          cc_data_size++;
-                        }
+                          DP_MSG_HIGH("SEI payload user_data_type_code is CEA encoded MPEG_cc_data()");
 
-                        if(cc_data_size > 0)
-                        {
-                          DP_MSG_LOW(
-                            "--------------  MPEG_cc_data()  -------------\n"
-                            "    cc_data ptr: %p cc_data_size: %lu\n",
-                            &data_ptr[8], cc_data_size);
-
-                          for (uint32_t i = 8; i < 8 + cc_data_size; i+=4) {
-                            DP_MSG_LOW("        %x %x %x %x",
-                              data_ptr[i], data_ptr[i+1],
-                              data_ptr[i+2], data_ptr[i+3]);
-                          }
-
-                          DP_MSG_LOW(
-                            "--------------  End of MPEG_cc_data()  -------------\n");
-
-                          sp<ABuffer> accessUnit = new ABuffer((OMX_U8*)&data_ptr[8], cc_data_size);
-
-                          int64_t mediaTimeUs;
-
-                          sp<ABuffer> buffer;
-                          CHECK(msg->findBuffer("buffer", &buffer));
-                          CHECK(buffer->meta()->findInt64("timeUs", &mediaTimeUs));
-                          accessUnit->meta()->setInt64("timeUs",mediaTimeUs);
-
-                          //To signal discontinuity in samples during seek and resume-out-of-tsb(internal seek) operations
-                          if(mTimedTextCEASamplesDisc)
+                          OMX_U32 cc_data_size = 0;
+                          for(int i = 8; data_ptr[i] != 0xFF /*each cc_data ends with marker bits*/; i++)
                           {
-                            accessUnit->meta()->setInt32("disc", 1);
-                            mTimedTextCEASamplesDisc = false;
+                            cc_data_size++;
                           }
 
-                          //Indicate timedtext CEA present in stream. Used to signal EOS in Codec::kWhatEOS
-                          if(!mTimedTextCEAPresent)
+                          if(cc_data_size > 0)
                           {
-                            mTimedTextCEAPresent = true;
+                            DP_MSG_LOW(
+                              "--------------  MPEG_cc_data()  -------------\n"
+                              "    cc_data ptr: %p cc_data_size: %lu\n",
+                              &data_ptr[8], cc_data_size);
+
+                            for (uint32_t i = 8; i < 8 + cc_data_size; i+=4) {
+                              DP_MSG_LOW("        %x %x %x %x",
+                                data_ptr[i], data_ptr[i+1],
+                                data_ptr[i+2], data_ptr[i+3]);
+                            }
+
+                            DP_MSG_LOW(
+                              "--------------  End of MPEG_cc_data()  -------------\n");
+
+                            sp<ABuffer> accessUnit = new ABuffer((OMX_U8*)&data_ptr[8], cc_data_size);
+
+                            int64_t mediaTimeUs;
+
+                            sp<ABuffer> buffer;
+                            CHECK(msg->findBuffer("buffer", &buffer));
+                            CHECK(buffer->meta()->findInt64("timeUs", &mediaTimeUs));
+                            accessUnit->meta()->setInt64("timeUs",mediaTimeUs);
+
+                            //To signal discontinuity in samples during seek and resume-out-of-tsb(internal seek) operations
+                            if(mTimedTextCEASamplesDisc)
+                            {
+                              accessUnit->meta()->setInt32("disc", 1);
+                              mTimedTextCEASamplesDisc = false;
+                            }
+
+                            //Indicate timedtext CEA present in stream. Used to signal EOS in Codec::kWhatEOS
+                            if(!mTimedTextCEAPresent)
+                            {
+                              mTimedTextCEAPresent = true;
+                            }
+
+                            sendTextPacket(accessUnit, OK, TIMED_TEXT_CEA);
+
+                            accessUnit = NULL;
+                            break;
                           }
-
-                          sendTextPacket(accessUnit, OK, TIMED_TEXT_CEA);
-
-                          accessUnit = NULL;
-                          break;
                         }
                       }
                     }
-
-                    pExtra = (OMX_OTHER_EXTRADATATYPE *) (((OMX_U8 *) pExtra) + pExtra->nSize);
+                    pExtra = (OMX_OTHER_EXTRADATATYPE *) (((OMX_U8 *) pExtra) + ((pExtra->nSize + 3) & (~3)));
                   }
-
                   graphicBuffer->unlock();
                 }
               }
             }
           }
         }
+        if ( mCCDecoder != NULL && mCCDecoder->isSelected())
+        {
+          DP_MSG_HIGH("Calling CCDecoder->display for TS %lld", mediaTimeUs);
+          mCCDecoder->display(mediaTimeUs);
+        }
+      }
+
+      /* This code handles freezes in foll. live embms use case for stream needing high DPB size.
+         Firmware will only return FBD's if the dpb (decoded picutre buffer) list is full. i.e.
+         if number of decoded frames in the dpb list falls below the dpb capacity fw will not
+         issue FBD to output buffers.
+
+         In a typical live scenario where we play current segment and next segment is only available
+         for download in the next available segment time, if the dpb size is high a lot of
+         frames are held by the fw toward the end of current segment before the next segment download
+         completes and sends samples on input port for decoding. This will cause momentary freezes
+         at the boundary of each segment for clips with high DPB.
+
+         Fix here is to adds a delay before rendering starts so that the media samples rendering cycle
+         is pushed ahead. This ensures the dpb queue is not running dry toward the end of current segment
+         and by then next segment has become available, downloaded and samples are sent.
+
+         Below condition adds this initial delay only for live content type where dpb size is high such that
+         mDecoderSetupTime < rendering time of #dpbSize number of frames
+
+         Equation:
+         if(decoderSetupTime < renderingTime for #dpb frames(i.e. dpbSize x sample duration))
+         {
+             introduce start up delay in rendering =
+                 renderingTime for #dpb frames - decoderSetupTime
+         } */
+
+      if (mSource != NULL && mSource->isLiveStream()
+              && !audio && mDPBCheckToDelayRendering) {
+
+          int64_t mediaTimeUs = 0;
+          CHECK(buffer->meta()->findInt64("timeUs", &mediaTimeUs));
+
+          if (mFirstVideoSampleUs < 0) {
+              mFirstVideoSampleUs = mediaTimeUs;
+          } else {
+              mVideoSampleDurationUs = mediaTimeUs - mFirstVideoSampleUs;
+
+              if (mDPBSize > 0 && mVideoSampleDurationUs > 0 &&
+                            (mVideoDecoderSetupTimeUs < (mDPBSize * mVideoSampleDurationUs))) {
+                  int delayRenderingUs = ((mDPBSize * mVideoSampleDurationUs) - mVideoDecoderSetupTimeUs);
+
+                  if (mDelayRenderingUs < delayRenderingUs) {
+                      DP_MSG_ERROR("videoDecoderSetupTime(%lld msec) < rendering time(%lld msec) of #dpbSize(%d) frames with sample duration(%llu msec)."
+                                   "rendering delay queued up to now = %lld msec,  queue additional delay = %lld msec",
+                                      (int64_t)mVideoDecoderSetupTimeUs/1000,
+                                      (int64_t)(double)(mDPBSize*mVideoSampleDurationUs/1000),
+                                      mDPBSize,
+                                      (int64_t)mVideoSampleDurationUs/1000,
+                                      (int64_t)mDelayRenderingUs/1000,
+                                      (int64_t)((delayRenderingUs - mDelayRenderingUs)/1000));
+                      mRenderer->queueDelay((delayRenderingUs - mDelayRenderingUs));
+                      mDelayRenderingUs = delayRenderingUs;
+                  }
+              }
+              mDPBCheckToDelayRendering = false;
+          }
       }
 
       mRenderer->queueBuffer(audio, buffer, reply);
@@ -1882,6 +2128,10 @@ void DashPlayer::flushDecoder(bool audio, bool needShutdown) {
                 || mFlushingVideo == AWAITING_DISCONTINUITY);
 
         mFlushingVideo = newStatus;
+
+        if (mCCDecoder != NULL) {
+            mCCDecoder->flush();
+        }
 
         if (mFlushingAudio == NONE) {
             mFlushingAudio = (mAudioDecoder != NULL)
@@ -1978,12 +2228,23 @@ status_t DashPlayer::getParameter(int key, Parcel *reply)
     else if(key == INVOKE_ID_GET_TRACK_INFO)
     {
       size_t numInbandTracks = (mSource != NULL) ? mSource->getTrackCount() : 0;
-      DP_MSG_HIGH("DashPlayer::getParameter #InbandTracks %d ", numInbandTracks);
+      size_t numCCTracks  = (mCCDecoder != NULL) ? mCCDecoder->getTrackCount() : 0;
+      DP_MSG_HIGH("DashPlayer::getParameter #InbandTracks %d #ccTracks %d ", numInbandTracks, numCCTracks);
       // total track count
-      reply->writeInt32(numInbandTracks);
+      reply->writeInt32(numInbandTracks + numCCTracks);
       // write inband tracks
       for (size_t i = 0; i < numInbandTracks; ++i) {
           writeTrackInfo(reply, mSource->getTrackInfo(i));
+      }
+      // write CC track
+      if (err == OK &&
+          numCCTracks > 0 &&
+          mCCDecoder != NULL)
+      {
+        for (size_t i = 0; i < numCCTracks; ++i)
+        {
+          writeTrackInfo(reply, mCCDecoder->getTrackInfo(i));
+        }
       }
     }
     else
@@ -2064,6 +2325,67 @@ void DashPlayer::writeTrackInfo(
   reply->writeInt32(trackType);
   reply->writeString16(String16(mime.c_str()));
   reply->writeString16(String16(lang.c_str()));
+
+ if (trackType == MEDIA_TRACK_TYPE_SUBTITLE)
+ {
+   int32_t isAuto, isDefault, isForced;
+   CHECK(format->findInt32("auto", &isAuto));
+   CHECK(format->findInt32("default", &isDefault));
+   CHECK(format->findInt32("forced", &isForced));
+   reply->writeInt32(isAuto);
+   reply->writeInt32(isDefault);
+   reply->writeInt32(isForced);
+  }
+}
+
+status_t DashPlayer::selectTrack(size_t trackIndex, bool select)
+{
+  status_t err = OK;
+  size_t numInbandTracks = (mSource != NULL) ? mSource->getTrackCount() : 0;
+  size_t numCCTracks  = (mCCDecoder != NULL) ? mCCDecoder->getTrackCount() : 0;
+  DP_MSG_HIGH("DashPlayer::selectTrack inbandTracks %d, ccTracks %d, trackIndex %d select %d",
+                numInbandTracks, numCCTracks, trackIndex, select);
+
+  if (trackIndex < numInbandTracks)
+  {
+    //Audio/video track selection not supported
+    DP_MSG_ERROR("Audio/video track selection not supported");
+    err = INVALID_OPERATION;
+  }
+  else
+  {
+    trackIndex -= numInbandTracks;
+    if (trackIndex < numCCTracks)
+    {
+      err = (mCCDecoder != NULL)? mCCDecoder->selectTrack(trackIndex, select) : OK;
+    }
+  }
+  return err;
+}
+
+
+status_t DashPlayer::getSelectedTrack(int32_t type, Parcel* reply)
+{
+  status_t err = OK;
+  int32_t trackType;
+  ssize_t selectedTrackIndex = -1;
+  size_t numInbandTracks = (mSource != NULL) ? mSource->getTrackCount() : 0;
+  size_t numCCTracks  = (mCCDecoder != NULL) ? mCCDecoder->getTrackCount() : 0;
+  if (type == MEDIA_TRACK_TYPE_SUBTITLE)
+  {
+    selectedTrackIndex = (mCCDecoder != NULL) ? mCCDecoder->getSelectedTrack() : -1;
+    if (selectedTrackIndex >= 0 && selectedTrackIndex < (ssize_t)numCCTracks)
+    {
+      selectedTrackIndex = numInbandTracks + selectedTrackIndex;
+    }
+  }
+  else
+  {
+    err = BAD_VALUE;
+  }
+  DP_MSG_HIGH("DashPlayer::getSelectedTrack tracktype %d and SelectedTrackIndex %d",type,selectedTrackIndex);
+  reply->writeInt32(selectedTrackIndex);
+  return err;
 }
 
 
@@ -2083,7 +2405,7 @@ status_t DashPlayer::setParameter(int key, const Parcel &request)
             return NO_MEMORY;
         }
 
-        utf16_to_utf8(str, len, (char*) data, len + 1);
+        utf16_to_utf8(str, len, (char*) data, len+1);
         if (mSource != NULL)
         {
           err = mSource->setParameter(key, data, len);
@@ -2096,6 +2418,16 @@ status_t DashPlayer::setParameter(int key, const Parcel &request)
       {
         err = mSource->setParameter(key, &value, sizeof(value));
       }
+    }
+    else if (key == INVOKE_ID_SELECT_TRACK)
+    {
+      int trackIndex = request.readInt32();
+      err = selectTrack(trackIndex, true /* select */);
+    }
+    else if (key == INVOKE_ID_UNSELECT_TRACK)
+    {
+      int trackIndex = request.readInt32();
+      err = selectTrack(trackIndex, false /* select */);
     }
     return err;
 }
